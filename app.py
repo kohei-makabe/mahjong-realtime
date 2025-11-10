@@ -297,18 +297,20 @@ hdf = get_hanchan(con, room_id)
 if hdf.empty:
     st.info("まだ成績がありません。")
 else:
-    agg = hdf.groupby("display_name").agg(
-        回数=("rank","count"),
-        1位=("rank", lambda s: (s==1).sum()),
-        2位=("rank", lambda s: (s==2).sum()),
-        3位=("rank", lambda s: (s==3).sum()),
-        4位=("rank", lambda s: (s==4).sum()),
-        収支合計=("net_cash","sum")
-    ).reset_index()
-    agg["平均順位"] = (hdf.groupby("display_name")["rank"].mean()).values
-    agg = agg.sort_values("収支合計", ascending=False)
+    g = hdf.groupby("display_name")
+    summary = pd.DataFrame({
+        "回数": g["rank"].count(),
+        "1位": g["rank"].apply(lambda s: (s == 1).sum()),
+        "2位": g["rank"].apply(lambda s: (s == 2).sum()),
+        "3位": g["rank"].apply(lambda s: (s == 3).sum()),
+        "4位": g["rank"].apply(lambda s: (s == 4).sum()),
+        "収支合計": g["net_cash"].sum(),
+        "平均順位": g["rank"].mean(),
+    }).reset_index()
+    summary = summary.sort_values("収支合計", ascending=False)
+
     st.write("### 個人成績（累積）")
-    st.dataframe(agg)
+    st.dataframe(summary)
 
     st.write("### 半荘履歴")
     disp = hdf.copy()
