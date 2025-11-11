@@ -270,11 +270,13 @@ with st.sidebar:
     con.close()
 
 st.caption("合計Pt=(最終点-返し)/1000 + ウマ + [トップOKA] + 役満pt×回数 + 焼き鳥pt。収支=合計Pt×レート。")
-if "room_id" not in st.session_state:
-    st.info("サイドバーからルームを作成/参加してください。"); st.stop()
+if room is None:
+    st.warning("以前のルームは削除されたか無効になっています。サイドバーから作成/参加し直してください。")
+    st.session_state.pop("room_id", None)
+    st.session_state.pop("player_id", None)
+    con.close()
+    st.stop()
 
-room_id = st.session_state["room_id"]
-con = connect(); room = get_room(con, room_id)
 if not room: st.error("ルームが見つかりません。"); st.stop()
 players_df = df_players(con, room_id)
 
