@@ -143,26 +143,31 @@ def apply_rounding(points: int, mode: str) -> int:
 
 
 def settlement_for_room(room: dict, finals: Dict[str, int]):
-    """点棒→精算（円）と着順、丸め後の最終点を返す"""
-    target = room["target_points"]
-    rate = room["rate_per_1000"]
-    uma = [room["uma1"], room["uma2"], room["uma3"], room["uma4"]]
-    oka_yen = room["oka_top"]
+    """
+    素点pt = (丸め後の最終点 - 返し)/1000
+    pt = 素点pt + ウマ(順位)
+    収支(円) = pt * レート
+    ※オカは使用しない（ゼロサム）
+    """
+    target = room["target_points"]          # 返し（例 25000）
+    rate   = room["rate_per_1000"]          # レート（円/千点）
+    uma    = [room["uma1"], room["uma2"], room["uma3"], room["uma4"]]  # 例 5-10→[10,5,-5,-10]
     rounding = room["rounding"]
 
+    # 100点丸め等を適用した最終点で着順を決める
     items = [(pid, apply_rounding(pts, rounding)) for pid, pts in finals.items()]
     items.sort(key=lambda x: x[1], reverse=True)
     ranks = {pid: i + 1 for i, (pid, _) in enumerate(items)}
 
-    nets = {pid: 0.0 for pid, _ in items}
+    nets_yen = {}
+    rounded_finals = {}
     for pid, pts in items:
-        base = (pts - target) / 1000.0 * rate
-        uma_yen = uma[ranks[pid] - 1] * rate
-        nets[pid] = base + uma_yen
-    # オカはトップだけに加算
-    top_pid = items[0][0]
-    nets[top_pid] += oka_yen
-    return nets, ranks, dict(items)
+        rounded_finals[pid] = pts
+        base_pt = (pts - target) / 1000.0        # 素点pt
+        total_pt = base_pt + uma[ranks[pid] - 1] # 素点pt + ウマ
+        nets_yen[pid] = total_pt * rate          # 円
+
+    return nets_yen, ranks, rounded_finals
 
 
 def row_to_dict(row, columns):
@@ -641,5 +646,5 @@ with tab_manage:
                         st.success("ミートを削除しました。")
                         st.rerun()
 
-st.caption("式: 精算 = (最終点 - 返し)/1000 * レート + UMA(順位)×レート + OKA(トップ/円)。丸め 'none' 推奨。")
+st.caption("式: pt = (最終点 - 返し)/1000 + UMA(順位) → 収支(円) = pt × レート。丸め 'none' 推奨。")
 con.close()
