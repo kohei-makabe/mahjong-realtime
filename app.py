@@ -1,15 +1,16 @@
 # app.py
-# 麻雀・リーグ（シーズン/ミート）デモ（スマホ最適化＋ルーム削除＋ミート修正＋シーズン通算＋素点/点棒表示）
-# - 代表固定なし：誰でも入力OK
+# 麻雀リーグ（フル機能統合版）
 # - 期(Season)→開催(Meet)→半荘 の階層管理
-# - 既定メンバー候補＋その場で追加
-# - 東南西北のプルダウンで参加者選択
+# - 代表固定なし：誰でも入力OK（ルームからプルダウン）
+# - 既定メンバー候補＋その場で追加、未登録の一括追加
 # - ルーム参加は「既存ルーム一覧から選択」
 # - ルーム削除（確認付き）
-# - ミートの名称/日付 修正・削除（削除時は関連半荘も整理）
-# - 成績に「素点(千点)」「点棒(最終点)」を追加、ミート単位/シーズン通算を切替
-# - スマホ向け：centered・サイドバー初期折りたたみ・タブ構成
-# - 2025-11-11: 個人成績テーブルの左端を「順位」列に変更（並べ替え後に付番、インデックスは非表示）
+# - ミートの名称/日付 修正・削除（関連半荘/結果も整理）
+# - 成績：素点(千点)/ポイント(pt)/収支(円) を表示、ミート/シーズン/全リーグの切替
+# - ランキング表は左端「順位」列表示（インデックス非表示）
+# - スマホ配慮（centered、初期サイドバー折りたたみ、軽量CSS）
+# - UMAとOKAはルームごとに設定可能（OKAは「なし/トップにpt加算/トップに円加算」を選択）
+# - 丸め設定：none/round/floor/ceil を最終点に適用して順位確定
 
 import streamlit as st
 import uuid
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 st.set_page_config(
-    page_title="麻雀・リーグ（シーズン/ミート）デモ",
+    page_title="麻雀リーグ精算ツール",
     page_icon="🀄",
     layout="centered",
     initial_sidebar_state="collapsed",
@@ -65,7 +66,6 @@ def init_db():
             start_points INTEGER NOT NULL,
             target_points INTEGER NOT NULL,
             rate_per_1000 REAL NOT NULL,
-            oka_top REAL NOT NULL,
             uma1 REAL NOT NULL,
             uma2 REAL NOT NULL,
             uma3 REAL NOT NULL,
@@ -120,6 +120,13 @@ def init_db():
         );
         """
     )
+    # --- 後方互換用：OKA設定（モード/pt/yen）をroomsに追加 ---
+    if not table_has_column(con, "rooms", "oka_mode"):
+        con.execute("ALTER TABLE rooms ADD COLUMN oka_mode TEXT DEFAULT 'none';")
+    if not table_has_column(con, "rooms", "oka_pt"):
+        con.execute("ALTER TABLE rooms ADD COLUMN oka_pt REAL DEFAULT 0;")
+    if not table_has_column(con, "rooms", "oka_yen"):
+        con.execute("ALTER TABLE rooms ADD COLUMN oka_yen REAL DEFAULT 0;")
     con.commit()
     con.close()
 
@@ -144,17 +151,20 @@ def apply_rounding(points: int, mode: str) -> int:
 
 def settlement_for_room(room: dict, finals: Dict[str, int]):
     """
-    素点pt = (丸め後の最終点 - 返し)/1000
-    pt = 素点pt + ウマ(順位)
-    収支(円) = pt * レート
-    ※オカは使用しない（ゼロサム）
+    最終点(丸め適用)で着順→
+    素点pt = (最終点 - 返し) / 1000
+    total_pt = 素点pt + UMA(順位) + (OKA_pt if トップかつモードpt)
+    収支(円) = total_pt × レート + (OKA_yen if トップかつモードyen)
     """
-    target = room["target_points"]          # 返し（例 25000）
-    rate   = room["rate_per_1000"]          # レート（円/千点）
-    uma    = [room["uma1"], room["uma2"], room["uma3"], room["uma4"]]  # 例 5-10→[10,5,-5,-10]
+    target = room["target_points"]
+    rate = room["rate_per_1000"]
+    uma = [room["uma1"], room["uma2"], room["uma3"], room["uma4"]]
     rounding = room["rounding"]
+    oka_mode = room.get("oka_mode", "none")  # 'none' | 'pt' | 'yen'
+    oka_pt = float(room.get("oka_pt", 0) or 0)
+    oka_yen = float(room.get("oka_yen", 0) or 0)
 
-    # 100点丸め等を適用した最終点で着順を決める
+    # 100点丸めなどを適用してから着順確定
     items = [(pid, apply_rounding(pts, rounding)) for pid, pts in finals.items()]
     items.sort(key=lambda x: x[1], reverse=True)
     ranks = {pid: i + 1 for i, (pid, _) in enumerate(items)}
@@ -163,9 +173,14 @@ def settlement_for_room(room: dict, finals: Dict[str, int]):
     rounded_finals = {}
     for pid, pts in items:
         rounded_finals[pid] = pts
-        base_pt = (pts - target) / 1000.0        # 素点pt
-        total_pt = base_pt + uma[ranks[pid] - 1] # 素点pt + ウマ
-        nets_yen[pid] = total_pt * rate          # 円
+        base_pt = (pts - target) / 1000.0     # 素点pt
+        total_pt = base_pt + uma[ranks[pid] - 1]
+        if ranks[pid] == 1 and oka_mode == "pt":
+            total_pt += oka_pt
+        net = total_pt * rate
+        if ranks[pid] == 1 and oka_mode == "yen":
+            net += oka_yen
+        nets_yen[pid] = net
 
     return nets_yen, ranks, rounded_finals
 
@@ -181,10 +196,12 @@ def get_room(con, room_id):
         return None
     cols = [d[0] for d in cur.description]
     d = row_to_dict(row, cols)
+    # 型補正
     for k in ["start_points", "target_points"]:
         d[k] = int(d[k])
-    for k in ["rate_per_1000", "oka_top", "uma1", "uma2", "uma3", "uma4"]:
-        d[k] = float(d[k])
+    for k in ["rate_per_1000", "uma1", "uma2", "uma3", "uma4", "oka_pt", "oka_yen"]:
+        d[k] = float(d.get(k, 0) or 0)
+    d["oka_mode"] = d.get("oka_mode", "none")
     return d
 
 
@@ -254,7 +271,7 @@ def points_input(label: str, key: str, default: int = 25000) -> int:
 
 
 # --------------- Sidebar：Room ---------------
-st.title("🀄 麻雀・リーグ（シーズン/ミート）デモ")
+st.title("🀄 麻雀リーグ精算ツール（フル版）")
 init_db()
 
 with st.sidebar:
@@ -267,24 +284,41 @@ with st.sidebar:
         with col1:
             start_points = st.number_input("持ち点(開始)", value=25000, step=100)
             target_points = st.number_input("返し(ターゲット)", value=25000, step=100)
-            rate_per_1000 = st.number_input("レート(円/千点)", value=100.0, step=10.0)
+            rate_per_1000 = st.number_input("レート(円/千点)", value=10.0, step=1.0)
         with col2:
-            oka_top = st.number_input("オカ(トップ/円)", value=2500.0, step=100.0)
             uma1 = st.number_input("ウマ 1位(+千点)", value=10.0, step=1.0)
             uma2 = st.number_input("ウマ 2位(+千点)", value=5.0, step=1.0)
             uma3 = st.number_input("ウマ 3位(−千点)", value=-5.0, step=1.0)
             uma4 = st.number_input("ウマ 4位(−千点)", value=-10.0, step=1.0)
         rounding = st.selectbox("点数丸め", ["none", "round", "floor", "ceil"], index=0)
+
+        st.markdown("#### OKA（トップボーナス）の扱い")
+        oka_mode = st.selectbox(
+            "OKAモード",
+            ["none（なし）", "pt（トップにpt加算）", "yen（トップに円加算）"],
+            index=0
+        )
+        col_ok1, col_ok2 = st.columns(2)
+        with col_ok1:
+            oka_pt = st.number_input("OKA pt（千点換算）", value=0.0, step=1.0, help="例：Mリーグ等の+20ptなら20")
+        with col_ok2:
+            oka_yen = st.number_input("OKA 円（直接加算）", value=0.0, step=100.0, help="トップに現金加算したい場合のみ使用")
+
         creator = st.text_input("あなたの表示名", value="あなた")
 
         if st.button("ルーム作成"):
             room_id = str(uuid.uuid4())
             con = connect()
             con.execute(
-                """INSERT INTO rooms(id,name,created_at,start_points,target_points,rate_per_1000,oka_top,uma1,uma2,uma3,uma4,rounding)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?);""",
-                (room_id, name, datetime.utcnow().isoformat(), start_points, target_points, rate_per_1000,
-                 oka_top, uma1, uma2, uma3, uma4, rounding)
+                """INSERT INTO rooms(
+                    id,name,created_at,start_points,target_points,rate_per_1000,
+                    uma1,uma2,uma3,uma4,rounding,oka_mode,oka_pt,oka_yen
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?);""",
+                (room_id, name, datetime.utcnow().isoformat(),
+                 start_points, target_points, rate_per_1000,
+                 uma1, uma2, uma3, uma4, rounding,
+                 "none" if oka_mode.startswith("none") else ("pt" if oka_mode.startswith("pt") else "yen"),
+                 oka_pt, oka_yen)
             )
             # ルーム作成者をとりあえず登録
             pid = str(uuid.uuid4())
@@ -474,9 +508,24 @@ with tab_results:
     if hdf.empty:
         st.info("まだ成績がありません。")
     else:
-        # 追加指標：素点(千点)
-        target = room["target_points"]
-        hdf["素点(千点)"] = (hdf["final_points"] - target) / 1000.0
+        # 数値化と素点
+        hdf["final_points"] = pd.to_numeric(hdf["final_points"], errors="coerce").fillna(0).astype(int)
+        target = int(room["target_points"])
+        rate = float(room["rate_per_1000"])
+        hdf["素点(千点)"] = ((hdf["final_points"] - target) / 1000.0).round(2)
+
+        # 参考：ポイント(pt)を逆算（ウマとOKAモードに基づく） ※履歴表示用
+        # rank→uma値のマップ
+        rank_to_uma = {1: room["uma1"], 2: room["uma2"], 3: room["uma3"], 4: room["uma4"]}
+        oka_mode = room.get("oka_mode", "none")
+        oka_pt = float(room.get("oka_pt", 0) or 0)
+        # ポイント(pt)（= 素点 + ウマ + (トップならOKA_pt)）
+        hdf["pt(千点)"] = hdf.apply(
+            lambda r: round(
+                ((r["final_points"] - target) / 1000.0) + rank_to_uma.get(int(r["rank"]), 0) + (oka_pt if (oka_mode == "pt" and int(r["rank"]) == 1) else 0)
+            , 2),
+            axis=1
+        )
 
         g = hdf.groupby("display_name")
         summary = pd.DataFrame({
@@ -485,9 +534,10 @@ with tab_results:
             "2位": g["rank"].apply(lambda s: (s == 2).sum()),
             "3位": g["rank"].apply(lambda s: (s == 3).sum()),
             "4位": g["rank"].apply(lambda s: (s == 4).sum()),
-            "収支合計(円)": g["net_cash"].sum(),
             "素点合計(千点)": g["素点(千点)"].sum().round(2),
             "平均素点(千点)": g["素点(千点)"].mean().round(2),
+            "pt合計(千点)": g["pt(千点)"].sum().round(2),
+            "収支合計(円)": g["net_cash"].sum().round(0),
             "平均順位": g["rank"].mean().round(2),
         }).reset_index()
 
@@ -510,10 +560,11 @@ with tab_results:
             "display_name": "プレイヤー",
             "rank": "着順",
             "素点(千点)": "素点(千点)",
+            "pt(千点)": "ポイント(千点)"
         })
         st.dataframe(
-            disp[["シーズン", "ミート", "プレイヤー", "点棒(最終点)", "素点(千点)", "着順", "精算(円)"]],
-            use_container_width=True, height=420
+            disp[["シーズン", "ミート", "プレイヤー", "点棒(最終点)", "素点(千点)", "ポイント(千点)", "着順", "精算(円)"]],
+            use_container_width=True, height=440
         )
 
         st.write("### 対人（ヘッドトゥヘッド）")
@@ -646,5 +697,5 @@ with tab_manage:
                         st.success("ミートを削除しました。")
                         st.rerun()
 
-st.caption("式: pt = (最終点 - 返し)/1000 + UMA(順位) → 収支(円) = pt × レート。丸め 'none' 推奨。")
+st.caption("式: 素点 = (最終点 - 返し)/1000,  pt = 素点 + UMA(+OKA pt),  収支 = pt×レート (+OKA円)。丸めは最終点に適用。")
 con.close()
