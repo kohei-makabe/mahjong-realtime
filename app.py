@@ -145,7 +145,7 @@ with st.sidebar:
         if st.button("ルーム作成"):
             rid = str(uuid.uuid4())
             con.execute(
-                "INSERT INTO rooms VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO rooms VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (rid, name, oka, rate, uma1, uma2, uma3, uma4, target, rounding, datetime.utcnow().isoformat()),
             )
             con.commit()
