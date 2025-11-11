@@ -182,29 +182,36 @@ def df_meets(con, season_id: str):
 def df_hanchan_join(con, room_id: str,
                     season_id: Optional[str] = None,
                     meet_id: Optional[str] = None):
+    """
+    hanchan/results に players, meets, seasons を結合して取得。
+    名前付きパラメータで安全にフィルタを付与。
+    """
     q = """
         SELECT h.id, h.room_id, h.meet_id, h.started_at, p.display_name,
                r.final_points, r.rank, r.base_pt, r.uma_pt, r.oka_bonus_pt,
                r.addon_pt, r.total_pt, r.net_cash, r.player_id,
                r.yakuman_count, r.yakitori,
-               m.name as meet_name, m.meet_date,
-               s.name as season_name
+               m.name AS meet_name, m.meet_date,
+               s.name AS season_name
         FROM hanchan h
         JOIN results r ON r.hanchan_id = h.id
         JOIN players p ON p.id = r.player_id
-        LEFT JOIN meets m ON m.id = h.meet_id
+        LEFT JOIN meets   m ON m.id = h.meet_id
         LEFT JOIN seasons s ON s.id = m.season_id
-        WHERE h.room_id=?
+        WHERE h.room_id = :rid
     """
-    params: List = [room_id]
-    if season_id:
-        q += " AND s.id=?"
-        params.append(season_id)
-    if meet_id:
-        q += " AND h.meet_id=?"
-        params.append(meet_id)
+    params = {"rid": room_id}
+
+    # ここで None のときは条件を追加しない（ズレ防止）
+    if season_id is not None:
+        q += " AND s.id = :sid"
+        params["sid"] = season_id
+    if meet_id is not None:
+        q += " AND h.meet_id = :mid"
+        params["mid"] = meet_id
+
     q += " ORDER BY datetime(h.started_at) DESC, r.rank ASC"
-    return pd.read_sql_query(q, con, params=tuple(params))
+    return pd.read_sql_query(q, con, params=params)
 
 def ensure_players(con, room_id: str, names: List[str]):
     cur = con.execute("SELECT display_name FROM players WHERE room_id=?", (room_id,))
