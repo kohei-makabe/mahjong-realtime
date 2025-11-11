@@ -1,11 +1,13 @@
 # app.py
-# 麻雀・リーグ（シーズン/ミート）デモ（スマホ最適化＋ルーム削除つき）
+# 麻雀・リーグ（シーズン/ミート）デモ（スマホ最適化＋ルーム削除＋ミート修正＋シーズン通算＋素点/点棒表示）
 # - 代表固定なし：誰でも入力OK
 # - 期(Season)→開催(Meet)→半荘 の階層管理
 # - 既定メンバー候補＋その場で追加
 # - 東南西北のプルダウンで参加者選択
 # - ルーム参加は「既存ルーム一覧から選択」
 # - ルーム削除（確認付き）
+# - ミートの名称/日付 修正・削除（削除時は関連半荘と結果も整理）
+# - 成績に「素点(千点)」「点棒(最終点)」を追加、シーズン通算切替
 # - スマホ向け：centered・サイドバー初期折りたたみ・タブ構成
 
 import streamlit as st
@@ -448,11 +450,24 @@ with tab_input:
 
 # ========== 成績タブ ==========
 with tab_results:
-    st.subheader("成績 / 履歴（シーズン/ミートで絞り込み）")
-    hdf = df_hanchan_join(con, room_id, sel_season_id, sel_meet_id)
+    st.subheader("成績 / 履歴")
+
+    # 集計単位の切り替え：ミート／シーズン
+    scope = "ミート"
+    if sel_season_id:
+        scope = st.radio("集計範囲", ["ミート（選択ミートのみ）", "シーズン（全ミート）"], horizontal=True,
+                         index=0 if sel_meet_id else 1)
+    use_season = (scope == "シーズン（全ミート）") or (sel_meet_id is None)
+    hdf = df_hanchan_join(con, room_id, sel_season_id if use_season else None,
+                          None if use_season else sel_meet_id)
+
     if hdf.empty:
         st.info("まだ成績がありません。")
     else:
+        # 追加指標：素点(千点)
+        target = room["target_points"]
+        hdf["素点(千点)"] = (hdf["final_points"] - target) / 1000.0
+
         g = hdf.groupby("display_name")
         summary = pd.DataFrame({
             "回数": g["rank"].count(),
@@ -460,29 +475,28 @@ with tab_results:
             "2位": g["rank"].apply(lambda s: (s == 2).sum()),
             "3位": g["rank"].apply(lambda s: (s == 3).sum()),
             "4位": g["rank"].apply(lambda s: (s == 4).sum()),
-            "収支合計": g["net_cash"].sum(),
-            "平均順位": g["rank"].mean(),
-        }).reset_index().sort_values("収支合計", ascending=False)
+            "収支合計(円)": g["net_cash"].sum(),
+            "素点合計(千点)": g["素点(千点)"].sum().round(2),
+            "平均素点(千点)": g["素点(千点)"].mean().round(2),
+            "平均順位": g["rank"].mean().round(2),
+        }).reset_index().sort_values("収支合計(円)", ascending=False)
         st.write("### 個人成績（累積）")
-        st.dataframe(summary, use_container_width=True, height=360)
+        st.dataframe(summary, use_container_width=True, height=380)
 
-        st.write("### 半荘履歴（主要列のみ）")
+        st.write("### 半荘履歴（主要列）")
         disp = hdf.copy()
-        disp["net_cash"] = disp["net_cash"].map(lambda x: f"{x:,.0f}")
-        disp["final_points"] = disp["final_points"].map(lambda x: f"{x:,}")
+        disp["精算(円)"] = disp["net_cash"].map(lambda x: f"{x:,.0f}")
+        disp["点棒(最終点)"] = disp["final_points"].map(lambda x: f"{x:,}")
         disp = disp.rename(columns={
             "season_name": "シーズン",
             "meet_name": "ミート",
             "display_name": "プレイヤー",
-            "final_points": "最終点",
             "rank": "着順",
-            "net_cash": "精算(円)",
-            "started_at": "開始UTC",
-            "memo": "メモ"
+            "素点(千点)": "素点(千点)",
         })
         st.dataframe(
-            disp[["シーズン", "ミート", "プレイヤー", "最終点", "着順", "精算(円)"]],
-            use_container_width=True, height=360
+            disp[["シーズン", "ミート", "プレイヤー", "点棒(最終点)", "素点(千点)", "着順", "精算(円)"]],
+            use_container_width=True, height=420
         )
 
         st.write("### 対人（ヘッドトゥヘッド）")
@@ -580,6 +594,40 @@ with tab_manage:
                     )
                     con.commit()
                     st.rerun()
+
+            # --- ミートの修正／削除 ---
+            st.markdown("#### ミート修正 / 削除")
+            if not meets_df2.empty:
+                # 編集対象のミートを選択
+                edit_meet_name = st.selectbox("編集対象ミート", meets_df2["name"].tolist(), key="meet_edit_pick")
+                edit_meet_id = meets_df2[meets_df2["name"] == edit_meet_name]["id"].values[0]
+                edit_meet_date = meets_df2[meets_df2["name"] == edit_meet_name]["meet_date"].values[0]
+
+                with st.form("meet_edit_form"):
+                    new_name = st.text_input("新しいミート名", value=edit_meet_name)
+                    new_date = st.date_input("新しい開催日", value=date.fromisoformat(edit_meet_date))
+                    do_update = st.form_submit_button("更新を保存")
+                    if do_update:
+                        con.execute("UPDATE meets SET name=?, meet_date=? WHERE id=?;",
+                                    (new_name, new_date.isoformat(), edit_meet_id))
+                        con.commit()
+                        st.success("ミート情報を更新しました。")
+                        st.rerun()
+
+                # 危険操作：削除
+                with st.expander("⚠️ ミート削除（関連半荘・結果も削除）", expanded=False):
+                    sure = st.checkbox("本当に削除する", key="meet_del_confirm")
+                    if st.button("このミートを削除", disabled=not sure):
+                        # 関連する半荘→結果も削除（resultsはCASCADEだが、meet紐づきhanchanを明示削除）
+                        cur = con.execute("SELECT id FROM hanchan WHERE meet_id=?;", (edit_meet_id,))
+                        hids = [r[0] for r in cur.fetchall()]
+                        if hids:
+                            con.executemany("DELETE FROM results WHERE hanchan_id=?;", [(hid,) for hid in hids])
+                            con.executemany("DELETE FROM hanchan WHERE id=?;", [(hid,) for hid in hids])
+                        con.execute("DELETE FROM meets WHERE id=?;", (edit_meet_id,))
+                        con.commit()
+                        st.success("ミートを削除しました。")
+                        st.rerun()
 
 st.caption("式: 精算 = (最終点 - 返し)/1000 * レート + UMA(順位)×レート + OKA(トップ/円)。丸め 'none' 推奨。")
 con.close()
