@@ -270,7 +270,7 @@ with colB:
                            VALUES (?,?,?,?,?,?);""",
                         (sid, room_id, s_name, s_start.isoformat(), s_end.isoformat(), datetime.utcnow().isoformat()))
             con.commit()
-            st.experimental_rerun()
+            st.rerun()
 
 sel_season_id = None
 if not seasons_df.empty:
@@ -295,7 +295,7 @@ if sel_season_id:
                                VALUES (?,?,?,?,?);""",
                             (mid, sel_season_id, m_name, m_date.isoformat(), datetime.utcnow().isoformat()))
                 con.commit()
-                st.experimental_rerun()
+                st.rerun()
     sel_meet_id = None
     if not meets_df.empty:
         sel_meet_name = st.selectbox("入力・表示対象ミート", meets_df["name"].tolist())
