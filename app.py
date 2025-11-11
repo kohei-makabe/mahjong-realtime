@@ -180,6 +180,14 @@ def init_db():
 
     con.commit(); con.close()
 
+# --- Streamlit rerun 互換ヘルパー ---
+def _rerun():
+    """Streamlit rerun のバージョン互換対応"""
+    if hasattr(st, "rerun"):
+        _rerun()
+    else:
+        _rerun()
+
 def df_rooms(con):
     return pd.read_sql_query(
         "SELECT id,name,created_at FROM rooms ORDER BY datetime(created_at) DESC;", con
@@ -282,7 +290,7 @@ with st.sidebar:
         try:
             if DB_PATH.exists(): DB_PATH.unlink()
             st.success("DBを削除しました。アプリを再実行します。")
-            st.experimental_rerun()
+            _rerun()
         except Exception as e:
             st.error(f"削除に失敗しました: {e}")
 
@@ -353,7 +361,7 @@ with st.sidebar:
                     con.commit()
                 st.session_state["room_id"]=join_id
                 st.session_state["player_id"]=pid
-                st.success("参加しました！"); st.experimental_rerun()
+                st.success("参加しました！"); _rerun()
         con.close()
 
     st.divider(); st.markdown("### 🗑️ ルーム削除")
@@ -371,7 +379,7 @@ with st.sidebar:
             con.commit(); con.close()
             if st.session_state.get("room_id")==del_id:
                 st.session_state.pop("room_id", None); st.session_state.pop("player_id", None)
-            st.success("削除しました。"); st.experimental_rerun()
+            st.success("削除しました。"); _rerun()
     else:
         st.caption("削除対象なし。")
     con.close()
@@ -538,10 +546,10 @@ with tab_manage:
         if st.button("追加"):
             if new_name.strip():
                 ensure_players(con, room_id, [new_name.strip()])
-                st.success(f"追加：{new_name.strip()}"); st.experimental_rerun()
+                st.success(f"追加：{new_name.strip()}"); _rerun()
     if st.button("未登録候補をまとめて登録"):
         ensure_players(con, room_id, pool)
-        st.success("未登録メンバーを登録しました。"); st.experimental_rerun()
+        st.success("未登録メンバーを登録しました。"); _rerun()
 
     st.divider(); st.subheader("シーズン")
     seasons_df = df_seasons(con, room_id)
@@ -558,7 +566,7 @@ with tab_manage:
                 con.execute("INSERT INTO seasons(id,room_id,name,start_date,end_date,created_at) VALUES(?,?,?,?,?,?)",
                             (str(uuid.uuid4()), room_id, s_name, s_start.isoformat(), s_end.isoformat(),
                              datetime.utcnow().isoformat()))
-                con.commit(); st.experimental_rerun()
+                con.commit(); _rerun()
 
     st.divider(); st.subheader("ミート（開催）")
     if seasons_df.empty:
@@ -578,7 +586,7 @@ with tab_manage:
                 if st.form_submit_button("ミート作成"):
                     con.execute("INSERT INTO meets(id,season_id,name,meet_date,created_at) VALUES(?,?,?,?,?)",
                                 (str(uuid.uuid4()), pick_sid, mn, md.isoformat(), datetime.utcnow().isoformat()))
-                    con.commit(); st.experimental_rerun()
+                    con.commit(); _rerun()
 
             st.markdown("#### ミート修正 / 削除")
             if not meets_df2.empty:
@@ -591,7 +599,7 @@ with tab_manage:
                     if st.form_submit_button("更新を保存"):
                         con.execute("UPDATE meets SET name=?, meet_date=? WHERE id=?",
                                     (new_n, new_d.isoformat(), edit_id))
-                        con.commit(); st.success("更新しました。"); st.experimental_rerun()
+                        con.commit(); st.success("更新しました。"); _rerun()
                 with st.expander("⚠️ ミート削除（関連半荘・結果も削除）", expanded=False):
                     sure = st.checkbox("本当に削除する", key="meet_del_ok")
                     if st.button("このミートを削除", disabled=not sure):
@@ -601,6 +609,6 @@ with tab_manage:
                             con.executemany("DELETE FROM results WHERE hanchan_id=?", [(hid,) for hid in hids])
                             con.executemany("DELETE FROM hanchan WHERE id=?", [(hid,) for hid in hids])
                         con.execute("DELETE FROM meets WHERE id=?", (edit_id,))
-                        con.commit(); st.success("削除しました。"); st.experimental_rerun()
+                        con.commit(); st.success("削除しました。"); _rerun()
 
 con.close()
