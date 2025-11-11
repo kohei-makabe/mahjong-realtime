@@ -1,5 +1,5 @@
 # app.py
-# 麻雀・リーグ（シーズン/ミート）デモ（スマホ最適化＋ルーム削除＋ミート修正＋シーズン通算＋素点/点棒表示）
+# 麻雀・リーグ（シーズン/ミート）デモ（スマホ最適化＋ルーム削除＋ミート修正＋シーズン/リーグ通算＋素点/点棒＋役満/焼き鳥）
 # - 代表固定なし：誰でも入力OK
 # - 期(Season)→開催(Meet)→半荘 の階層管理
 # - 既定メンバー候補＋その場で追加
@@ -7,7 +7,7 @@
 # - ルーム参加は「既存ルーム一覧から選択」
 # - ルーム削除（確認付き）
 # - ミートの名称/日付 修正・削除（削除時は関連半荘と結果も整理）
-# - 成績に「素点(千点)」「点棒(最終点)」を追加、シーズン通算切替
+# - 成績に「素点(千点)」「点棒(最終点)」「役満」「焼き鳥」を追加、シーズン/リーグ/全体通算切替
 # - スマホ向け：centered・サイドバー初期折りたたみ・タブ構成
 
 import streamlit as st
@@ -16,7 +16,7 @@ import sqlite3
 import pandas as pd
 from datetime import datetime, date
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 st.set_page_config(
     page_title="麻雀・リーグ（シーズン/ミート）デモ",
@@ -38,23 +38,21 @@ DB_PATH = Path("mahjong.db")
 # 既定メンバー（初期候補）
 DEFAULT_MEMBERS = ["眞壁", "内藤", "森", "浜野", "傅田", "須崎", "中間", "高田", "内藤士"]
 
-
 # ---------------- Utilities ----------------
 def connect():
     con = sqlite3.connect(DB_PATH)
     con.execute("PRAGMA foreign_keys = ON;")
     return con
 
-
 def table_has_column(con, table: str, col: str) -> bool:
     cur = con.execute(f"PRAGMA table_info({table});")
     cols = [r[1] for r in cur.fetchall()]
     return col in cols
 
-
 def init_db():
     con = connect()
     cur = con.cursor()
+    # ベーススキーマ
     cur.executescript(
         """
         CREATE TABLE IF NOT EXISTS rooms (
@@ -117,22 +115,40 @@ def init_db():
         );
         """
     )
-    # hanchan に meet_id が無ければ追加
+    # --- マイグレーション（不足列を追加） ---
+    # hanchan: meet_id
     if not table_has_column(con, "hanchan", "meet_id"):
         try:
             con.execute("ALTER TABLE hanchan ADD COLUMN meet_id TEXT;")
         except Exception:
             pass
+    # seasons: league（前期/後期）
+    if not table_has_column(con, "seasons", "league"):
+        try:
+            con.execute("ALTER TABLE seasons ADD COLUMN league TEXT DEFAULT '前期';")
+        except Exception:
+            pass
+    # results: yakuman（役満回数）
+    if not table_has_column(con, "results", "yakuman"):
+        try:
+            con.execute("ALTER TABLE results ADD COLUMN yakuman INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+    # results: yakitori（焼き鳥=上がり無し）
+    if not table_has_column(con, "results", "yakitori"):
+        try:
+            con.execute("ALTER TABLE results ADD COLUMN yakitori INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+
     con.commit()
     con.close()
-
 
 def df_rooms(con):
     return pd.read_sql_query(
         "SELECT id, name, created_at FROM rooms ORDER BY datetime(created_at) DESC;",
         con
     )
-
 
 def apply_rounding(points: int, mode: str) -> int:
     if mode == "none":
@@ -144,9 +160,8 @@ def apply_rounding(points: int, mode: str) -> int:
     else:  # 'round'
         return int(round(points / 100.0) * 100)
 
-
 def settlement_for_room(room: dict, finals: Dict[str, int]):
-    """点棒→精算（円）と着順、丸め後の最終点を返す"""
+    """点棒→精算（円）と着順、丸め後の最終点を返す（ウマ/オカ/返し/レートに対応）"""
     target = room["target_points"]
     rate = room["rate_per_1000"]
     uma = [room["uma1"], room["uma2"], room["uma3"], room["uma4"]]
@@ -167,10 +182,8 @@ def settlement_for_room(room: dict, finals: Dict[str, int]):
     nets[top_pid] += oka_yen
     return nets, ranks, dict(items)
 
-
 def row_to_dict(row, columns):
     return {columns[i]: row[i] for i in range(len(columns))}
-
 
 def get_room(con, room_id):
     cur = con.execute("SELECT * FROM rooms WHERE id=?;", (room_id,))
@@ -185,13 +198,11 @@ def get_room(con, room_id):
         d[k] = float(d[k])
     return d
 
-
 def df_players(con, room_id):
     return pd.read_sql_query(
         "SELECT * FROM players WHERE room_id=? ORDER BY joined_at;",
         con, params=(room_id,)
     )
-
 
 def df_seasons(con, room_id):
     return pd.read_sql_query(
@@ -199,19 +210,18 @@ def df_seasons(con, room_id):
         con, params=(room_id,)
     )
 
-
 def df_meets(con, season_id):
     return pd.read_sql_query(
         "SELECT * FROM meets WHERE season_id=? ORDER BY meet_date;",
         con, params=(season_id,)
     )
 
-
 def df_hanchan_join(con, room_id, season_id: Optional[str] = None, meet_id: Optional[str] = None):
     q = """
         SELECT h.id, h.room_id, h.meet_id, h.started_at, h.finished_at, h.memo,
                p.display_name, r.final_points, r.rank, r.net_cash, r.player_id,
-               m.name as meet_name, m.meet_date, s.name as season_name
+               r.yakuman, r.yakitori,
+               m.name as meet_name, m.meet_date, s.name as season_name, s.league as league
         FROM hanchan h
         JOIN results r ON r.hanchan_id = h.id
         JOIN players p ON p.id = r.player_id
@@ -219,7 +229,7 @@ def df_hanchan_join(con, room_id, season_id: Optional[str] = None, meet_id: Opti
         LEFT JOIN seasons s ON s.id = m.season_id
         WHERE h.room_id=?
     """
-    params = [room_id]
+    params: List = [room_id]
     if season_id:
         q += " AND s.id=?"
         params.append(season_id)
@@ -229,8 +239,7 @@ def df_hanchan_join(con, room_id, season_id: Optional[str] = None, meet_id: Opti
     q += " ORDER BY h.started_at DESC, r.rank ASC;"
     return pd.read_sql_query(q, con, params=tuple(params))
 
-
-def ensure_players(con, room_id: str, names: list[str]) -> None:
+def ensure_players(con, room_id: str, names: List[str]) -> None:
     """roomに未登録のdisplay_nameがあれば追加する"""
     cur = con.execute("SELECT display_name FROM players WHERE room_id=?", (room_id,))
     have = {r[0] for r in cur.fetchall()}
@@ -245,11 +254,8 @@ def ensure_players(con, room_id: str, names: list[str]) -> None:
     if changed:
         con.commit()
 
-
-# 点数入力（フォーム内で安全：number_inputのみ）
 def points_input(label: str, key: str, default: int = 25000) -> int:
     return int(st.number_input(label, value=default, step=100, key=f"{key}_num"))
-
 
 # --------------- Sidebar：Room ---------------
 st.title("🀄 麻雀・リーグ（シーズン/ミート）デモ")
@@ -311,7 +317,6 @@ with st.sidebar:
             st.caption(f"Room ID: `{selected_room_id}`")
             name_in = st.text_input("あなたの表示名", value="あなた")
             if st.button("参加"):
-                # 既に同名がいれば既存ID、なければ作成
                 cur = con.execute(
                     "SELECT id FROM players WHERE room_id=? AND display_name=?",
                     (selected_room_id, name_in)
@@ -352,15 +357,15 @@ with st.sidebar:
             con.execute("DELETE FROM rooms WHERE id=?;", (selected_room_id_del,))
             con.commit()
             st.success("ルームを削除しました。")
-            # もし削除したルームが現在選択中ならセッションを初期化
             if st.session_state.get("room_id") == selected_room_id_del:
                 st.session_state.pop("room_id", None)
                 st.session_state.pop("player_id", None)
             st.rerun()
     con.close()
 
-st.caption("誰でも入力OK。シーズン→ミート→半荘で管理します。")
+st.caption("式: 精算 = (最終点 - 返し)/1000 * レート + UMA(順位)×レート + OKA(トップ/円)。丸め 'none' 推奨。")
 
+# ---------------- メイン ----------------
 if "room_id" not in st.session_state:
     st.info("左のサイドバーからルームを作成/参加してください。")
     st.stop()
@@ -377,13 +382,13 @@ players_df = df_players(con, room_id)
 st.write(f"**ルーム: {room['name']}**")
 st.dataframe(
     players_df[["display_name", "joined_at"]].rename(columns={"display_name": "プレイヤー", "joined_at": "参加"}),
-    use_container_width=True, height=260
+    use_container_width=True, height=240
 )
 
 # ---- 共通セレクタ（シーズン/ミート） ----
 seasons_df = df_seasons(con, room_id)
-sel_season_id = None
-sel_meet_id = None
+sel_season_id: Optional[str] = None
+sel_meet_id: Optional[str] = None
 
 if not seasons_df.empty:
     sel_season_name = st.selectbox("集計対象シーズン", seasons_df["name"].tolist(), key="season_sel_top")
@@ -426,25 +431,48 @@ with tab_input:
                 finals[name_to_id[west]]  = p_w
                 finals[name_to_id[north]] = p_n
 
+                st.write("**役満 / 焼き鳥**（役満は回数、焼き鳥は上がり無しの人にチェック）")
+                col_y1, col_y2 = st.columns(2)
+                with col_y1:
+                    yk_e = st.number_input(f"{east} 役満回数", min_value=0, max_value=10, value=0, step=1)
+                    yk_s = st.number_input(f"{south} 役満回数", min_value=0, max_value=10, value=0, step=1)
+                    yk_w = st.number_input(f"{west} 役満回数", min_value=0, max_value=10, value=0, step=1)
+                    yk_n = st.number_input(f"{north} 役満回数", min_value=0, max_value=10, value=0, step=1)
+                with col_y2:
+                    yt_e = st.checkbox(f"{east} 焼き鳥")
+                    yt_s = st.checkbox(f"{south} 焼き鳥")
+                    yt_w = st.checkbox(f"{west} 焼き鳥")
+                    yt_n = st.checkbox(f"{north} 焼き鳥")
+
                 memo = st.text_input("メモ（任意）", value="")
                 submitted = st.form_submit_button("精算を記録")
 
                 if submitted:
                     nets, ranks, rounded_finals = settlement_for_room(room, finals)
                     hid = str(uuid.uuid4())
+                    con = connect()
                     con.execute(
                         "INSERT INTO hanchan(id, room_id, started_at, finished_at, memo, meet_id) VALUES (?,?,?,?,?,?);",
                         (hid, room_id, datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), memo, sel_meet_id)
                     )
-                    for name in picked:
+                    # 役満/焼き鳥を結果に保存
+                    per_player = [
+                        (east,  yk_e, yt_e),
+                        (south, yk_s, yt_s),
+                        (west,  yk_w, yt_w),
+                        (north, yk_n, yt_n),
+                    ]
+                    for name, yakuman_cnt, yakitori_flag in per_player:
                         pid = name_to_id[name]
                         rid = str(uuid.uuid4())
                         con.execute(
-                            "INSERT INTO results(id, hanchan_id, player_id, final_points, rank, net_cash) VALUES (?,?,?,?,?,?);",
-                            (rid, hid, pid, int(rounded_finals[pid]), int(ranks[pid]), float(nets[pid]))
+                            "INSERT INTO results(id, hanchan_id, player_id, final_points, rank, net_cash, yakuman, yakitori) VALUES (?,?,?,?,?,?,?,?);",
+                            (rid, hid, pid, int(rounded_finals[pid]), int(ranks[pid]),
+                             float(nets[pid]), int(yakuman_cnt), int(1 if yakitori_flag else 0))
                         )
-                    con.commit()
+                    con.commit(); con.close()
                     st.success("半荘を登録しました！")
+                    st.rerun()
     else:
         st.info("まず『👤 メンバー/設定』でシーズンとミートを作成・選択してください。")
 
@@ -452,14 +480,47 @@ with tab_input:
 with tab_results:
     st.subheader("成績 / 履歴")
 
-    # 集計単位の切り替え：ミート／シーズン
-    scope = "ミート"
+    # 集計単位の切り替え：ミート／シーズン／リーグ／全リーグ
+    scope = "ミート（選択ミートのみ）"
     if sel_season_id:
-        scope = st.radio("集計範囲", ["ミート（選択ミートのみ）", "シーズン（全ミート）"], horizontal=True,
-                         index=0 if sel_meet_id else 1)
-    use_season = (scope == "シーズン（全ミート）") or (sel_meet_id is None)
-    hdf = df_hanchan_join(con, room_id, sel_season_id if use_season else None,
-                          None if use_season else sel_meet_id)
+        scope = st.radio(
+            "集計範囲",
+            ["ミート（選択ミートのみ）", "シーズン（全ミート）", "リーグ（前期/後期）", "全リーグ（すべて）"],
+            horizontal=True,
+            index=0 if sel_meet_id else 1
+        )
+    # データ取得
+    if scope == "ミート（選択ミートのみ）" and sel_meet_id:
+        hdf = df_hanchan_join(con, room_id, None, sel_meet_id)
+    elif scope == "シーズン（全ミート）" and sel_season_id:
+        hdf = df_hanchan_join(con, room_id, sel_season_id, None)
+    elif scope == "リーグ（前期/後期）":
+        # 選択シーズンの league でフィルタ
+        if sel_season_id:
+            lg = pd.read_sql_query("SELECT league FROM seasons WHERE id=?", con, params=(sel_season_id,)).iloc[0]["league"]
+            # league一致のシーズンIDを収集
+            sids = pd.read_sql_query("SELECT id FROM seasons WHERE room_id=? AND league=?", con, params=(room_id, lg))["id"].tolist()
+            if sids:
+                ph = ",".join(["?"]*len(sids))
+                hdf = pd.read_sql_query(f"""
+                    SELECT hh.*, pp.display_name, rr.final_points, rr.rank, rr.net_cash, rr.player_id,
+                           rr.yakuman, rr.yakitori, mm.name AS meet_name, mm.meet_date,
+                           ss.name AS season_name, ss.league AS league
+                    FROM hanchan hh
+                    JOIN results rr ON rr.hanchan_id = hh.id
+                    JOIN players pp ON pp.id = rr.player_id
+                    LEFT JOIN meets mm ON mm.id = hh.meet_id
+                    LEFT JOIN seasons ss ON ss.id = mm.season_id
+                    WHERE hh.room_id=? AND ss.id IN ({ph})
+                    ORDER BY hh.started_at DESC, rr.rank ASC;
+                """, con, params=(room_id, *sids))
+            else:
+                hdf = pd.DataFrame()
+        else:
+            hdf = pd.DataFrame()
+    else:
+        # 全リーグ（room内の全データ）
+        hdf = df_hanchan_join(con, room_id, None, None)
 
     if hdf.empty:
         st.info("まだ成績がありません。")
@@ -479,9 +540,11 @@ with tab_results:
             "素点合計(千点)": g["素点(千点)"].sum().round(2),
             "平均素点(千点)": g["素点(千点)"].mean().round(2),
             "平均順位": g["rank"].mean().round(2),
-        }).reset_index().sort_values("収支合計(円)", ascending=False)
+            "役満": g["yakuman"].sum(),
+            "焼き鳥": g["yakitori"].sum()
+        }).reset_index().sort_values(["収支合計(円)","1位"], ascending=[False, False])
         st.write("### 個人成績（累積）")
-        st.dataframe(summary, use_container_width=True, height=380)
+        st.dataframe(summary, use_container_width=True, height=400)
 
         st.write("### 半荘履歴（主要列）")
         disp = hdf.copy()
@@ -492,10 +555,12 @@ with tab_results:
             "meet_name": "ミート",
             "display_name": "プレイヤー",
             "rank": "着順",
+            "yakuman": "役満",
+            "yakitori": "焼き鳥",
             "素点(千点)": "素点(千点)",
         })
         st.dataframe(
-            disp[["シーズン", "ミート", "プレイヤー", "点棒(最終点)", "素点(千点)", "着順", "精算(円)"]],
+            disp[["シーズン", "ミート", "プレイヤー", "点棒(最終点)", "素点(千点)", "着順", "役満", "焼き鳥", "精算(円)"]],
             use_container_width=True, height=420
         )
 
@@ -537,33 +602,39 @@ with tab_manage:
     with col_add2:
         if st.button("追加"):
             if new_name.strip():
+                con = connect()
                 ensure_players(con, room_id, [new_name.strip()])
+                con.close()
                 st.success(f"追加しました：{new_name.strip()}")
                 st.rerun()
     if st.button("未登録の候補をまとめて登録"):
+        con = connect()
         ensure_players(con, room_id, selected_candidates)
+        con.close()
         st.success("未登録メンバーを登録しました。")
         st.rerun()
 
     st.divider()
     st.subheader("シーズン")
+    con = connect()
     seasons_df = df_seasons(con, room_id)
     colA, colB = st.columns([2, 1])
     with colA:
         st.dataframe(
-            seasons_df.rename(columns={"name": "シーズン名", "start_date": "開始日", "end_date": "終了日"}),
+            seasons_df.rename(columns={"name": "シーズン名", "start_date": "開始日", "end_date": "終了日", "league": "リーグ"}),
             use_container_width=True, height=260
         )
     with colB:
         with st.form("season_form"):
             s_name = st.text_input("シーズン名", value=f"{date.today().year} 前期")
+            s_league = st.selectbox("リーグ（前期/後期）", ["前期", "後期"])
             s_start = st.date_input("開始日", value=date(date.today().year, 1, 1))
             s_end = st.date_input("終了日", value=date(date.today().year, 6, 30))
             if st.form_submit_button("シーズン作成"):
                 sid = str(uuid.uuid4())
                 con.execute(
-                    "INSERT INTO seasons(id,room_id,name,start_date,end_date,created_at) VALUES (?,?,?,?,?,?);",
-                    (sid, room_id, s_name, s_start.isoformat(), s_end.isoformat(), datetime.utcnow().isoformat())
+                    "INSERT INTO seasons(id,room_id,name,start_date,end_date,created_at,league) VALUES (?,?,?,?,?,?,?);",
+                    (sid, room_id, s_name, s_start.isoformat(), s_end.isoformat(), datetime.utcnow().isoformat(), s_league)
                 )
                 con.commit()
                 st.rerun()
@@ -598,7 +669,6 @@ with tab_manage:
             # --- ミートの修正／削除 ---
             st.markdown("#### ミート修正 / 削除")
             if not meets_df2.empty:
-                # 編集対象のミートを選択
                 edit_meet_name = st.selectbox("編集対象ミート", meets_df2["name"].tolist(), key="meet_edit_pick")
                 edit_meet_id = meets_df2[meets_df2["name"] == edit_meet_name]["id"].values[0]
                 edit_meet_date = meets_df2[meets_df2["name"] == edit_meet_name]["meet_date"].values[0]
@@ -618,7 +688,6 @@ with tab_manage:
                 with st.expander("⚠️ ミート削除（関連半荘・結果も削除）", expanded=False):
                     sure = st.checkbox("本当に削除する", key="meet_del_confirm")
                     if st.button("このミートを削除", disabled=not sure):
-                        # 関連する半荘→結果も削除（resultsはCASCADEだが、meet紐づきhanchanを明示削除）
                         cur = con.execute("SELECT id FROM hanchan WHERE meet_id=?;", (edit_meet_id,))
                         hids = [r[0] for r in cur.fetchall()]
                         if hids:
@@ -628,6 +697,4 @@ with tab_manage:
                         con.commit()
                         st.success("ミートを削除しました。")
                         st.rerun()
-
-st.caption("式: 精算 = (最終点 - 返し)/1000 * レート + UMA(順位)×レート + OKA(トップ/円)。丸め 'none' 推奨。")
-con.close()
+    con.close()
