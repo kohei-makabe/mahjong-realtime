@@ -1,10 +1,11 @@
 # app.py
-# 麻雀・リーグ（シーズン/ミート）デモ（スマホ最適化版）
+# 麻雀・リーグ（シーズン/ミート）デモ（スマホ最適化＋ルーム削除つき）
 # - 代表固定なし：誰でも入力OK
 # - 期(Season)→開催(Meet)→半荘 の階層管理
 # - 既定メンバー候補＋その場で追加
-# - 東南西北のプルダウン＋クイック±ボタンで点数入力
+# - 東南西北のプルダウンで参加者選択
 # - ルーム参加は「既存ルーム一覧から選択」
+# - ルーム削除（確認付き）
 # - スマホ向け：centered・サイドバー初期折りたたみ・タブ構成
 
 import streamlit as st
@@ -243,23 +244,9 @@ def ensure_players(con, room_id: str, names: list[str]) -> None:
         con.commit()
 
 
-# 点数入力（スマホ向けクイック±ボタン付き）
+# 点数入力（フォーム内で安全：number_inputのみ）
 def points_input(label: str, key: str, default: int = 25000) -> int:
-    v = st.number_input(label, value=default, step=100, key=f"{key}_num")
-    b1, b2, b3, b4 = st.columns(4)
-    with b1:
-        if st.button("-1000", key=f"{key}_m1000"):
-            v = int(v) - 1000
-    with b2:
-        if st.button("-500", key=f"{key}_m500"):
-            v = int(v) - 500
-    with b3:
-        if st.button("+500", key=f"{key}_p500"):
-            v = int(v) + 500
-    with b4:
-        if st.button("+1000", key=f"{key}_p1000"):
-            v = int(v) + 1000
-    return max(0, int(v))
+    return int(st.number_input(label, value=default, step=100, key=f"{key}_num"))
 
 
 # --------------- Sidebar：Room ---------------
@@ -342,6 +329,33 @@ with st.sidebar:
                 st.success("参加しました！")
                 st.rerun()
         con.close()
+
+    # --- ルーム削除機能（確認付き） ---
+    st.divider()
+    st.markdown("### 🗑️ ルーム削除")
+    con = connect()
+    rooms_df2 = df_rooms(con)
+    if rooms_df2.empty:
+        st.caption("まだルームは存在しません。")
+    else:
+        def fmt_room(r):
+            ts = r["created_at"].split("T")[0] + " " + r["created_at"][11:16]
+            return f'{r["name"]}（{ts}）'
+        labels_del = [fmt_room(r) for _, r in rooms_df2.iterrows()]
+        idx_del = st.selectbox("削除するルームを選択", options=list(range(len(labels_del))),
+                               format_func=lambda i: labels_del[i], key="del_room")
+        selected_room_id_del = rooms_df2.iloc[idx_del]["id"]
+        confirm = st.checkbox("⚠️ 本当に削除する（すべてのシーズン・成績が失われます）")
+        if st.button("ルーム削除実行", disabled=not confirm):
+            con.execute("DELETE FROM rooms WHERE id=?;", (selected_room_id_del,))
+            con.commit()
+            st.success("ルームを削除しました。")
+            # もし削除したルームが現在選択中ならセッションを初期化
+            if st.session_state.get("room_id") == selected_room_id_del:
+                st.session_state.pop("room_id", None)
+                st.session_state.pop("player_id", None)
+            st.rerun()
+    con.close()
 
 st.caption("誰でも入力OK。シーズン→ミート→半荘で管理します。")
 
